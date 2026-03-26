@@ -1,0 +1,24 @@
+# Оркестрация: бот + PostgreSQL
+services:
+  telegram_bot:
+      build: .
+          container_name: devops_task_bot
+	      env_file: .env
+	          volumes:
+		        - ./data:/app/data
+			      - ./src:/app/src
+			            - /var/run/docker.sock:/var/run/docker.sock
+				          - ../it-wiki:/it-wiki
+    depends_on:
+      - postgres
+  postgres:
+    image: postgres:15-alpine
+    container_name: devops_bot_db
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+volumes:
+  postgres_data:

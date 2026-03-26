@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.Python
+env/
+venv/
+.env
+*.log
+
+# Project specific
+bot/data/
+bot/logs/
+it-wiki/
+output/
+archive/
+builds/
+keystore/
+
+# Docker
+*.pid
+*.lock
