@@ -182,7 +182,7 @@ def _run_builder(chat_id, user_id, app_name, package, version, bot, wiki_path, o
             KEYSTORE_PATH: {"bind": "/keystore", "mode": "ro"}
         }
         container = _docker.containers.run(
-            "sber-wiki-builder",
+            "apk-builder",
             volumes=volumes,
             environment=env,
             mem_limit=f"{MEMORY_PER_BUILDER // (1024*1024)}m",

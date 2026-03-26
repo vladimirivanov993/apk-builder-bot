@@ -97,7 +97,7 @@ cat > bot/docker-compose.yml << 'EOF'
 services:
   telegram_bot:
       build: .
-          container_name: devops_task_bot
+          container_name: apk_builder_bot
 	      env_file: .env
 	          volumes:
 		        - ./data:/app/data
@@ -108,7 +108,7 @@ services:
       - postgres
   postgres:
     image: postgres:15-alpine
-    container_name: devops_bot_db
+    container_name: apk_builder_db
     environment:
       POSTGRES_USER: ${POSTGRES_USER}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}

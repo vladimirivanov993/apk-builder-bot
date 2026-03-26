@@ -7,7 +7,7 @@ export PATH=$PATH:$ANDROID_HOME/platform-tools:$ANDROID_HOME/cmdline-tools/lates
 export GRADLE_OPTS="-Xmx512m -XX:MaxMetaspaceSize=256m -Dsun.net.client.defaultConnectTimeout=300000 -Dsun.net.client.defaultReadTimeout=300000"
 export GRADLE_USER_HOME="/tmp/gradle-cache"
 
-APP_NAME="${APP_NAME:-SberWiki}"
+APP_NAME="${APP_NAME:-sberWiki}"
 PACKAGE="${PACKAGE:-com.sber.wiki}"
 VERSION="${VERSION:-1.0.0}"
 BUILD_TYPE="${BUILD_TYPE:-release}"
