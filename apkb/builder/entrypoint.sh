@@ -72,8 +72,8 @@ fi
 
 if [ "$BUILD_TYPE" = "release" ] && [ -f "$KEYSTORE_PATH" ] && [ -n "$KEYSTORE_PASS" ] && [ -n "$KEY_ALIAS" ]; then
     echo "🔑 Подписываем APK..."
-    $ANDROID_HOME/build-tools/35.0.0/zipalign -v -p 4 "$UNSIGNED_APK" /tmp/app-aligned.apk
-    $ANDROID_HOME/build-tools/35.0.0/apksigner sign \
+    $ANDROID_HOME/build-tools/36.0.0/zipalign -v -p 4 "$UNSIGNED_APK" /tmp/app-aligned.apk
+    $ANDROID_HOME/build-tools/36.0.0/apksigner sign \
         --ks "$KEYSTORE_PATH" \
         --ks-key-alias "$KEY_ALIAS" \
         --ks-pass env:KEYSTORE_PASS \
@@ -83,7 +83,8 @@ if [ "$BUILD_TYPE" = "release" ] && [ -f "$KEYSTORE_PATH" ] && [ -n "$KEYSTORE_P
     echo "✅ Подписанный APK в /output/app.apk"
 else
     cp "$UNSIGNED_APK" /output/app.apk
-    echo "✅ Неподписанный APK скопирован в /output/app.apk"
+    echo "Неподписанный APK скопирован в /output/app.apk"
 fi
 
 echo "✅ Сборка завершена"
+
