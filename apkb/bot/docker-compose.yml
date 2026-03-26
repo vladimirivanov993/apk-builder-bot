@@ -1,16 +1,23 @@
-# Оркестрация: бот + PostgreSQL
 services:
   telegram_bot:
-      build: .
-          container_name: apk_builder_bot
-	      env_file: .env
-	          volumes:
-		        - ./data:/app/data
-			      - ./src:/app/src
-			            - /var/run/docker.sock:/var/run/docker.sock
-				          - ../it-wiki:/it-wiki
+    build: .
+    container_name: apk_builder_bot
+    env_file: .env
+    command: python -m src.bot
+    volumes:
+      - ./data:/app/data
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ../it-wiki:/it-wiki
+    environment:
+      - TZ=Europe/Moscow
+      - PYTHONPATH=/app
+      - DOCKER_HOST=unix:///var/run/docker.sock
     depends_on:
       - postgres
+    dns:
+      - 8.8.8.8
+      - 1.1.1.1
+
   postgres:
     image: postgres:15-alpine
     container_name: apk_builder_db
@@ -20,5 +27,9 @@ services:
       POSTGRES_DB: ${POSTGRES_DB}
     volumes:
       - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    restart: unless-stopped
+
 volumes:
   postgres_data:

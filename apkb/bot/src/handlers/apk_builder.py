@@ -35,7 +35,7 @@ _send_queue = Queue()
 _active_builds_details = {}
 _active_builds_details_lock = threading.Lock()
 
-_docker = docker.from_env()
+_docker = docker.DockerClient(base_url='unix:///var/run/docker.sock')
 
 BASE_BUILDS_DIR = "/it-wiki/builds"
 BASE_OUTPUT_DIR = "/it-wiki/output"
