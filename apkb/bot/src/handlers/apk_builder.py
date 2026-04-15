@@ -70,6 +70,14 @@ _active_builds_details_lock = threading.Lock()
 _shutting_down = False
 _shutdown_lock = threading.Lock()
 
+def set_application(app):
+    global _app, _loop
+    _app = app
+    try:
+        _loop = asyncio.get_running_loop()
+    except RuntimeError:
+        _loop = asyncio.get_event_loop()
+
 def get_active_builds_count():
     with _active_builds_count_lock:
         return _active_builds_count
