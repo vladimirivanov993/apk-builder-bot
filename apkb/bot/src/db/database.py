@@ -1,5 +1,6 @@
 import asyncpg
 import logging
+import json
 from typing import Optional
 
 logger = logging.getLogger(__name__)
@@ -99,4 +100,44 @@ async def set_maintenance_mode(enabled: bool):
         await conn.execute(
             "UPDATE settings SET value = $1 WHERE key = 'maintenance_mode'",
             'true' if enabled else 'false'
+        )
+
+# ---------- Новые функции для graceful shutdown ----------
+async def set_shutdown_flag(flag: bool):
+    async with _pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO settings (key, value) VALUES ('shutdown_requested', $1) "
+            "ON CONFLICT (key) DO UPDATE SET value = $1",
+            'true' if flag else 'false'
+        )
+
+async def get_shutdown_flag() -> bool:
+    async with _pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT value FROM settings WHERE key = 'shutdown_requested'")
+        return row['value'].lower() == 'true' if row else False
+
+async def save_pending_queue(queue_items: list):
+    async with _pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO settings (key, value) VALUES ('pending_queue', $1) "
+            "ON CONFLICT (key) DO UPDATE SET value = $1",
+            json.dumps(queue_items)
+        )
+
+async def load_pending_queue() -> list:
+    async with _pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT value FROM settings WHERE key = 'pending_queue'")
+        if row and row['value']:
+            return json.loads(row['value'])
+        return []
+
+async def reset_processing_builds(reason: str = "reset by admin"):
+    async with _pool.acquire() as conn:
+        await conn.execute(
+            """
+            UPDATE builds 
+            SET status = 'failed', error_message = $1, completed_at = NOW()
+            WHERE status = 'processing'
+            """,
+            reason
         )
