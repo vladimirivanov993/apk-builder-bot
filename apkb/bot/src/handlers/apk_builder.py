@@ -47,7 +47,16 @@ os.makedirs(ARCHIVE_PATH, exist_ok=True)
 
 _app = None
 _loop = None
+
 MEMORY_PER_BUILDER = int(settings.builder_memory_gb * 1024 * 1024 * 1024)
+
+def get_free_memory():
+    try:
+        info = _docker.info()
+        return info.get('MemAvailable', info.get('MemFree', 0))
+    except:
+        return MEMORY_PER_BUILDER
+
 MAX_PARALLEL_BUILDS = max(1, get_free_memory() // MEMORY_PER_BUILDER)
 
 _build_semaphore = threading.BoundedSemaphore(value=MAX_PARALLEL_BUILDS)
@@ -60,13 +69,6 @@ _active_builds_details_lock = threading.Lock()
 
 _shutting_down = False
 _shutdown_lock = threading.Lock()
-
-def get_free_memory():
-    try:
-        info = _docker.info()
-        return info.get('MemAvailable', info.get('MemFree', 0))
-    except:
-        return MEMORY_PER_BUILDER
 
 def get_active_builds_count():
     with _active_builds_count_lock:
