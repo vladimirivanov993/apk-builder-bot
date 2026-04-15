@@ -62,7 +62,6 @@ def main():
         # Регистрация обработчиков
         register_handlers(app)
         app.add_handlers(commands.handlers)
-        app.add_error_handler(commands.error_handler)
         
         # Настройка команд меню
         app.post_init = commands.setup_bot_commands
