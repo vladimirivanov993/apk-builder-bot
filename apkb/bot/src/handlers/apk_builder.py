@@ -1,7 +1,6 @@
 """
 Модуль для сборки APK из ZIP-архива с поддержкой параллельных сборок.
-Ограничения: один пользователь — одна активная сборка.
-Добавлена проверка безопасности: только статические файлы, очистка HTML, запрет внешних ссылок и изображений.
+Исправленная версия после код-ревью.
 """
 
 import asyncio
@@ -12,7 +11,7 @@ import threading
 import time
 import zipfile
 import re
-from queue import Queue
+from queue import Queue, Empty
 from telegram import Update
 from telegram.ext import ContextTypes, ConversationHandler, CommandHandler, MessageHandler, filters
 import bleach
@@ -28,13 +27,7 @@ from ..db.database import (
 
 ASK_NAME, ASK_PACKAGE, ASK_VERSION, ASK_ZIP = range(4)
 
-_active_builds = 0
-_build_queue = Queue()
-_build_lock = threading.Lock()
-_send_queue = Queue()
-_active_builds_details = {}
-_active_builds_details_lock = threading.Lock()
-
+# Глобальные переменные
 _docker = docker.DockerClient(base_url='unix:///var/run/docker.sock')
 
 BASE_BUILDS_DIR = "/it-wiki/builds"
@@ -50,11 +43,6 @@ _app = None
 _loop = None
 MEMORY_PER_BUILDER = int(settings.builder_memory_gb * 1024 * 1024 * 1024)
 
-def set_application(app):
-    global _app, _loop
-    _app = app
-    _loop = asyncio.get_event_loop()
-
 def get_free_memory():
     try:
         info = _docker.info()
@@ -62,12 +50,27 @@ def get_free_memory():
     except:
         return MEMORY_PER_BUILDER
 
-def can_start_builder():
-    return get_free_memory() >= MEMORY_PER_BUILDER
+# Вычисляем максимальное количество параллельных сборок один раз при старте
+MAX_PARALLEL_BUILDS = max(1, get_free_memory() // MEMORY_PER_BUILDER)
+
+# Семафор для ограничения параллельных сборок
+_build_semaphore = threading.BoundedSemaphore(value=MAX_PARALLEL_BUILDS)
+# Очередь задач
+_build_queue = Queue()
+# Очередь для отправки результатов
+_send_queue = Queue()
+
+# Надёжный счётчик активных сборок
+_active_builds_count = 0
+_active_builds_count_lock = threading.Lock()
+
+# Детали активных сборок (для мониторинга)
+_active_builds_details = {}
+_active_builds_details_lock = threading.Lock()
 
 def get_active_builds_count():
-    with _build_lock:
-        return _active_builds
+    with _active_builds_count_lock:
+        return _active_builds_count
 
 def get_build_queue_size():
     return _build_queue.qsize()
@@ -92,16 +95,16 @@ def _remove_build_detail(build_id):
     with _active_builds_details_lock:
         _active_builds_details.pop(build_id, None)
 
-def validate_site_files(wiki_path: str) -> tuple[bool, str]:
-    """
-    Проверяет все файлы в папке wiki_path:
-    - Разрешены только статические расширения (текст, код, но без изображений).
-    - Для HTML: очистка через bleach, запрет внешних ссылок, запрет data:image.
-    """
-    allowed_extensions = {
-        '.html', '.htm', '.css', '.txt', '.md', '.xml', '.json'
-    }
+def _is_safe_path(base_dir, member_path):
+    real_base = os.path.realpath(base_dir)
+    real_member = os.path.realpath(os.path.join(base_dir, member_path))
+    return real_member.startswith(real_base)
 
+def validate_site_files(wiki_path: str) -> tuple[bool, str]:
+    allowed_extensions = {
+        '.html', '.htm', '.css', '.txt', '.md', '.xml', '.json',
+        '.png', '.jpg', '.jpeg', '.gif', '.svg'
+    }
     allowed_tags = {
         'html', 'head', 'title', 'body',
         'h1', 'h2', 'h3', 'h4', 'h5', 'h6',
@@ -110,13 +113,11 @@ def validate_site_files(wiki_path: str) -> tuple[bool, str]:
         'br', 'hr', 'strong', 'em', 'b', 'i', 'u',
         'form', 'input', 'button', 'label'
     }
-
     allowed_attributes = {
         'a': {'href', 'title', 'target'},
         'img': {'src', 'alt', 'title', 'width', 'height'},
         '*': {'id', 'class', 'style'}
     }
-
     allowed_protocols = {'http', 'https', 'mailto', 'ftp'}
 
     for root, dirs, files in os.walk(wiki_path):
@@ -136,21 +137,14 @@ def validate_site_files(wiki_path: str) -> tuple[bool, str]:
                 # Запрет data:image
                 data_image_pattern = re.compile(r'(src|href|background-image)\s*=\s*["\']?\s*url\(?["\']?data:image/', re.IGNORECASE)
                 if data_image_pattern.search(content):
-                    return False, f"Файл {file} содержит встроенные изображения (data:image). Загрузите архив без изображений."
+                    return False, f"Файл {file} содержит встроенные изображения (data:image)."
 
                 try:
-                    cleaned = bleach.clean(
-                        content,
-                        tags=allowed_tags,
-                        attributes=allowed_attributes,
-                        protocols=allowed_protocols,
-                        strip=False,
-                        strip_comments=True
-                    )
-                    if cleaned != content:
-                        return False, f"Файл {file} содержит небезопасный HTML (скрипты или опасные атрибуты)."
+                    # Запрет опасных тегов
+                    if re.search(r'<(script|iframe|object|embed|applet)', content, re.IGNORECASE):
+                        return False, f"Файл {file} содержит запрещённые теги (script, iframe и т.д.)."
 
-                    # Поиск внешних ссылок
+                    # Внешние ссылки
                     pattern = r'(href|src|action)\s*=\s*["\']([^"\']*://[^"\']*)["\']'
                     matches = re.findall(pattern, content, re.IGNORECASE)
                     if matches:
@@ -159,14 +153,11 @@ def validate_site_files(wiki_path: str) -> tuple[bool, str]:
                             return False, f"Файл {file} содержит внешние ссылки: {', '.join(bad_links[:3])}."
                 except Exception as e:
                     return False, f"Ошибка обработки HTML в {file}: {e}"
-
     return True, ""
 
 def _run_builder(chat_id, user_id, app_name, package, version, bot, wiki_path, output_path, build_id):
-    global _active_builds
-    with _build_lock:
-        _active_builds += 1
-
+    """Запуск Docker-контейнера сборки. Выполняется в отдельном потоке."""
+    container = None
     try:
         env = {
             "APP_NAME": app_name,
@@ -186,7 +177,7 @@ def _run_builder(chat_id, user_id, app_name, package, version, bot, wiki_path, o
             volumes=volumes,
             environment=env,
             mem_limit=f"{MEMORY_PER_BUILDER // (1024*1024)}m",
-            remove=True,
+            remove=False,
             detach=True
         )
         _add_build_detail(build_id, chat_id, user_id, app_name, package, version, container.id, time.time())
@@ -204,51 +195,82 @@ def _run_builder(chat_id, user_id, app_name, package, version, bot, wiki_path, o
                     record_build_complete(build_id, new_apk_name),
                     _loop
                 )
-                _send_queue.put((chat_id, final_apk_path, None, (wiki_path, output_path), build_id))
+                _send_queue.put((chat_id, final_apk_path, None, build_id))
             else:
                 asyncio.run_coroutine_threadsafe(
                     record_build_failed(build_id, "APK не найден после сборки."),
                     _loop
                 )
-                _send_queue.put((chat_id, None, "APK не найден после сборки.", (wiki_path, output_path), build_id))
+                _send_queue.put((chat_id, None, "APK не найден после сборки.", build_id))
         else:
-            error_msg = f"Сборка завершилась с ошибкой (код {result['StatusCode']})."
+            logs = container.logs(tail=50).decode('utf-8', errors='replace')[:1000]
+            error_msg = f"Сборка завершилась с ошибкой (код {result['StatusCode']}).\nЛоги:\n{logs}"
             asyncio.run_coroutine_threadsafe(
                 record_build_failed(build_id, error_msg),
                 _loop
             )
-            _send_queue.put((chat_id, None, error_msg, (wiki_path, output_path), build_id))
+            _send_queue.put((chat_id, None, error_msg, build_id))
     except Exception as e:
         error_msg = f"Ошибка при запуске сборщика: {e}"
         asyncio.run_coroutine_threadsafe(
             record_build_failed(build_id, error_msg),
             _loop
         )
-        _send_queue.put((chat_id, None, error_msg, (wiki_path, output_path), build_id))
+        _send_queue.put((chat_id, None, error_msg, build_id))
     finally:
+        if container:
+            try:
+                container.remove(force=True)
+            except:
+                pass
         _remove_build_detail(build_id)
-        with _build_lock:
-            _active_builds -= 1
-        if not _build_queue.empty() and can_start_builder():
-            next_task = _build_queue.get()
-            threading.Thread(target=_run_builder, args=next_task).start()
+        shutil.rmtree(wiki_path, ignore_errors=True)
+        shutil.rmtree(output_path, ignore_errors=True)
+        # Освобождаем семафор и уменьшаем счётчик активных сборок
+        _build_semaphore.release()
+        with _active_builds_count_lock:
+            global _active_builds_count
+            _active_builds_count -= 1
+
+def _queue_worker():
+    """Воркер очереди: забирает задачи, захватывает семафор, запускает сборку."""
+    while True:
+        try:
+            task = _build_queue.get()
+            if task is None:
+                break
+            _build_semaphore.acquire()
+            # Увеличиваем счётчик активных сборок
+            with _active_builds_count_lock:
+                global _active_builds_count
+                _active_builds_count += 1
+            try:
+                threading.Thread(target=_run_builder, args=task).start()
+            except Exception as e:
+                # Если запуск потока не удался, освобождаем семафор и уменьшаем счётчик
+                _build_semaphore.release()
+                with _active_builds_count_lock:
+                    _active_builds_count -= 1
+                print(f"Ошибка запуска потока сборки: {e}")
+        except Exception as e:
+            print(f"Ошибка в queue_worker: {e}")
 
 def schedule_build(chat_id, user_id, app_name, package, version, bot, wiki_path, output_path, build_id):
-    if can_start_builder():
-        threading.Thread(target=_run_builder, args=(chat_id, user_id, app_name, package, version, bot, wiki_path, output_path, build_id)).start()
-    else:
-        _build_queue.put((chat_id, user_id, app_name, package, version, bot, wiki_path, output_path, build_id))
-        asyncio.run_coroutine_threadsafe(
-            bot.send_message(chat_id, "Сервер загружен, ваша сборка поставлена в очередь. Дождитесь завершения."),
-            _loop
-        )
+    """Помещает задачу в очередь и уведомляет пользователя о позиции."""
+    queue_pos = _build_queue.qsize() + 1
+    _build_queue.put((chat_id, user_id, app_name, package, version, bot, wiki_path, output_path, build_id))
+    asyncio.run_coroutine_threadsafe(
+        bot.send_message(chat_id, f"📦 Сборка добавлена в очередь. Позиция: {queue_pos}. Ожидайте..."),
+        _loop
+    )
 
 async def _process_send_queue():
+    """Асинхронный воркер для отправки результатов пользователям."""
     while True:
         item = await asyncio.get_event_loop().run_in_executor(None, _send_queue.get)
         if item is None:
             break
-        chat_id, file_path, error_msg, dirs, build_id = item
+        chat_id, file_path, error_msg, build_id = item
         try:
             if file_path:
                 with open(file_path, 'rb') as f:
@@ -256,19 +278,16 @@ async def _process_send_queue():
             else:
                 await _app.bot.send_message(chat_id=chat_id, text=error_msg)
         except Exception as e:
-            await _app.bot.send_message(chat_id=chat_id, text=f"Не удалось отправить: {e}")
-        finally:
-            for d in dirs:
-                shutil.rmtree(d, ignore_errors=True)
+            await _app.bot.send_message(chat_id=chat_id, text=f"Не удалось отправить результат: {e}")
         await asyncio.sleep(0.5)
 
+# Обработчики команд Telegram
 async def start_build(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if await get_maintenance_mode():
         await update.message.reply_text("🛠 Сервер на техническом обслуживании. Сборка временно недоступна.")
         return ConversationHandler.END
-    active_build_id = await get_user_active_build(user_id)
-    if active_build_id:
+    if await get_user_active_build(user_id):
         await update.message.reply_text("У вас уже есть активная сборка. Дождитесь её завершения.")
         return ConversationHandler.END
     await update.message.reply_text("Введите название приложения (например, MyApp):")
@@ -288,6 +307,19 @@ async def ask_version(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['version'] = update.message.text
     await update.message.reply_text("Теперь отправьте ZIP-архив с файлами вашего сайта (index.html и остальные).\nУбедитесь, что index.html находится в корне архива.")
     return ASK_ZIP
+
+def cleanup_old_dirs(base_path, max_age_seconds=86400):
+    """Удаляет папки старше max_age_seconds."""
+    now = time.time()
+    for name in os.listdir(base_path):
+        path = os.path.join(base_path, name)
+        if os.path.isdir(path):
+            try:
+                mtime = os.path.getmtime(path)
+                if now - mtime > max_age_seconds:
+                    shutil.rmtree(path, ignore_errors=True)
+            except:
+                pass
 
 async def handle_zip(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -317,6 +349,9 @@ async def handle_zip(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         with zipfile.ZipFile(zip_path, 'r') as zf:
+            for member in zf.namelist():
+                if not _is_safe_path(wiki_path, member):
+                    raise Exception(f"Недопустимый путь в архиве: {member}")
             zf.extractall(wiki_path)
         os.remove(zip_path)
     except Exception as e:
@@ -325,7 +360,7 @@ async def handle_zip(update: Update, context: ContextTypes.DEFAULT_TYPE):
         shutil.rmtree(output_path, ignore_errors=True)
         return ConversationHandler.END
 
-    # Если внутри архива одна папка, перемещаем её содержимое наверх
+    # Нормализация структуры: если внутри одна папка, поднимаем содержимое
     items = os.listdir(wiki_path)
     if len(items) == 1 and os.path.isdir(os.path.join(wiki_path, items[0])):
         subdir = os.path.join(wiki_path, items[0])
@@ -333,7 +368,6 @@ async def handle_zip(update: Update, context: ContextTypes.DEFAULT_TYPE):
             shutil.move(os.path.join(subdir, f), wiki_path)
         os.rmdir(subdir)
 
-    # Проверяем наличие index.html
     index_path = os.path.join(wiki_path, "index.html")
     if not os.path.exists(index_path):
         await update.message.reply_text("В архиве не найден index.html. Убедитесь, что файл находится в корне архива.")
@@ -341,11 +375,9 @@ async def handle_zip(update: Update, context: ContextTypes.DEFAULT_TYPE):
         shutil.rmtree(output_path, ignore_errors=True)
         return ConversationHandler.END
 
-    # Проверка безопасности
     valid, error_msg = validate_site_files(wiki_path)
     if not valid:
-        await update.message.reply_text(f"❌ Проверка безопасности не пройдена: {error_msg}\n"
-                                        "Сборка отменена. Пожалуйста, убедитесь, что архив содержит только статические файлы и не содержит внешних ссылок или скриптов.")
+        await update.message.reply_text(f"❌ Проверка безопасности не пройдена: {error_msg}\nСборка отменена.")
         shutil.rmtree(wiki_path, ignore_errors=True)
         shutil.rmtree(output_path, ignore_errors=True)
         return ConversationHandler.END
@@ -370,7 +402,7 @@ async def handle_zip(update: Update, context: ContextTypes.DEFAULT_TYPE):
         build_id=build_id
     )
 
-    await update.message.reply_text("Сборка запущена. Я уведомлю, когда APK будет готов.")
+    # Не отправляем дополнительное сообщение, т.к. schedule_build уже отправил уведомление
     return ConversationHandler.END
 
 async def cancel_build(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -391,6 +423,29 @@ build_handlers = [
 ]
 
 def register_handlers(app):
+    """Регистрация обработчиков и запуск фоновых воркеров."""
+    global _app, _loop
+    _app = app
+    try:
+        _loop = asyncio.get_running_loop()
+    except RuntimeError:
+        _loop = asyncio.get_event_loop()
+
     for handler in build_handlers:
         app.add_handler(handler)
-    asyncio.get_event_loop().create_task(_process_send_queue())
+
+    # Очистка старых временных папок при старте
+    cleanup_old_dirs(BASE_BUILDS_DIR, max_age_seconds=3600)  # удаляем папки старше часа
+    cleanup_old_dirs(BASE_OUTPUT_DIR, max_age_seconds=3600)
+
+    # Запуск воркера очереди сборок в отдельном потоке
+    worker_thread = threading.Thread(target=_queue_worker, daemon=True)
+    worker_thread.start()
+
+    # Запуск асинхронного воркера отправки как задачи в текущем event loop
+    # Если event loop ещё не запущен, задача будет выполнена после запуска цикла
+    # Для надёжности используем app.create_task (если доступно)
+    if hasattr(app, 'create_task'):
+        app.create_task(_process_send_queue())
+    else:
+        asyncio.run_coroutine_threadsafe(_process_send_queue(), _loop)
