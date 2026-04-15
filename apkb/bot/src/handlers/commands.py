@@ -1,8 +1,6 @@
-"""
-Обработчики команд для Telegram бота.
-"""
-
 import time
+import os
+import shutil
 from telegram import Update, BotCommand
 from telegram.ext import ContextTypes, CommandHandler, MessageHandler, filters
 
@@ -19,12 +17,15 @@ from src.handlers.apk_builder import (
     get_active_builds_count,
     get_build_queue_size,
     get_active_builds_details,
-    get_free_memory
+    get_free_memory,
+    _build_queue,
+    BASE_BUILDS_DIR,
+    BASE_OUTPUT_DIR
 )
-from src.db.database import get_maintenance_mode, set_maintenance_mode
+from src.db.database import get_maintenance_mode, set_maintenance_mode, reset_processing_builds, save_pending_queue
 
 # ============================================================================
-# ОСНОВНЫЕ КОМАНДЫ БОТА (не относящиеся к сборке APK)
+# ОСНОВНЫЕ КОМАНДЫ БОТА
 # ============================================================================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -66,6 +67,7 @@ async def help_commands(update: Update, context: ContextTypes.DEFAULT_TYPE):
 **Административные:**
   /maintenance [on|off] - Включить/выключить режим обслуживания
   /admin_status - Показать состояние сервера (память, очередь, активные сборки)
+  /reset_pending_builds - Сбросить все ожидающие сборки и очистить временные папки
 """
     await update.message.reply_text(help_text, parse_mode='Markdown')
 
@@ -102,11 +104,10 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"📊 Всего задач: {total}")
 
 async def sync_admins_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Для совместимости со старой логикой (можно оставить заглушку)
     await update.message.reply_text("Команда не реализована в текущей версии.")
 
 # ============================================================================
-# АДМИНИСТРАТИВНЫЕ КОМАНДЫ (для сборки APK)
+# АДМИНИСТРАТИВНЫЕ КОМАНДЫ
 # ============================================================================
 
 async def maintenance_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -160,17 +161,36 @@ async def admin_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
     await update.message.reply_text(text, parse_mode='Markdown')
 
+async def reset_pending_builds(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not settings.is_admin(user_id):
+        await update.message.reply_text("⛔ У вас нет прав.")
+        return
+    # Сбросить все processing сборки в БД
+    await reset_processing_builds("reset by admin")
+    # Очистить очередь в памяти
+    while not _build_queue.empty():
+        _build_queue.get_nowait()
+    # Очистить сохранённую очередь в БД
+    await save_pending_queue([])
+    # Удалить временные папки
+    for d in [BASE_BUILDS_DIR, BASE_OUTPUT_DIR]:
+        if os.path.exists(d):
+            for item in os.listdir(d):
+                path = os.path.join(d, item)
+                if os.path.isdir(path):
+                    shutil.rmtree(path, ignore_errors=True)
+    await update.message.reply_text("✅ Все ожидающие сборки сброшены, временные папки очищены.")
+
 # ============================================================================
-# ПЕРЕСЫЛКА БЫСТРЫХ СООБЩЕНИЙ (старая логика)
+# ПЕРЕСЫЛКА БЫСТРЫХ СООБЩЕНИЙ
 # ============================================================================
 
 async def forward_task_to_devs(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Проверяем диалог
     if context.user_data.get('task_in_progress'):
         is_dialog_handled = await handle_dialog_step(update, context)
         if is_dialog_handled:
             return
-    # Обычная пересылка (заглушка)
     await update.message.reply_text("Быстрые сообщения не пересылаются в этой версии.")
 
 # ============================================================================
@@ -193,6 +213,7 @@ async def setup_bot_commands(application):
         commands.extend([
             BotCommand("maintenance", "Режим обслуживания (админ)"),
             BotCommand("admin_status", "Статус сервера (админ)"),
+            BotCommand("reset_pending_builds", "Сбросить ожидающие сборки (админ)"),
         ])
     await application.bot.set_my_commands(commands)
 
@@ -210,9 +231,10 @@ handlers = [
     CommandHandler("newtask", newtask_command),
     CommandHandler("task", taskinfo_command),
     CommandHandler("cancel", cancel_task_dialog),
-    CommandHandler("build", start_build),   # команда сборки APK
+    CommandHandler("build", start_build),
     CommandHandler("maintenance", maintenance_command),
     CommandHandler("admin_status", admin_status),
+    CommandHandler("reset_pending_builds", reset_pending_builds),
     *get_task_handlers(),
     MessageHandler(
         filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE,
