@@ -481,7 +481,4 @@ def register_handlers(app):
     worker_thread.start()
 
     # Запуск асинхронного воркера отправки
-    if hasattr(app, 'create_task'):
-        app.create_task(_process_send_queue())
-    else:
-        _loop.create_task(_process_send_queue())
+    _loop.create_task(_process_send_queue())
